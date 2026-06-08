@@ -47,7 +47,7 @@ PIXEL_TO_MM = 0.1
 # Function 1: Simple Text Endpoint
 @app.get("/api/hello")
 async def get_message():
-    return {"message": "Hello from your FastAPI backend! 🚀"}
+    return {"message": "Hello from your FastAPI backend 2! 🚀"}
 
 
 @app.post("/api/upload")
