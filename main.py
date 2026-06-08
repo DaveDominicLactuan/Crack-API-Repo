@@ -213,6 +213,7 @@ def preprocess_and_save_format(image_path):
 
         # 1. Crop the clean region of interest
         cropped_roi = image[y:y+h, x:x+w]
+        # cv2.imshow(f"Cropped ROI {i}", cropped_roi)  # Debug: Show the cropped ROI to verify it's correct
 
         # 2. Encode to Base64 and save to cropped_roi_objectStore
         success, buffer = cv2.imencode('.jpg', cropped_roi)
