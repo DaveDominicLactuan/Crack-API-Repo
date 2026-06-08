@@ -47,7 +47,7 @@ PIXEL_TO_MM = 0.1
 # Function 1: Simple Text Endpoint
 @app.get("/api/hello")
 async def get_message():
-    return {"message": "Hello from your FastAPI backend 2! 🚀"}
+    return {"message": "Hello from your FastAPI backend 3! 🚀"}
 
 
 @app.post("/api/upload")
@@ -81,15 +81,15 @@ async def upload_image(file: UploadFile = File(...)):
     # cv2.imwrite(os.path.join(PROCESSED_DIR, mask_filename), cleaned_mask)
     
     # 4. Open the image in a window (Using Native OS viewer)
-    try:
-        if sys.platform == "win32":
-            os.startfile(processed_file_path)  # Windows
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", processed_file_path])  # macOS
-        else:
-            subprocess.Popen(["xdg-open", processed_file_path])  # Linux
-    except Exception as e:
-        print(f"Log: Could not open system window. Error: {e}")
+    # try:
+    #     if sys.platform == "win32":
+    #         os.startfile(processed_file_path)  # Windows
+    #     elif sys.platform == "darwin":
+    #         subprocess.Popen(["open", processed_file_path])  # macOS
+    #     else:
+    #         subprocess.Popen(["xdg-open", processed_file_path])  # Linux
+    # except Exception as e:
+    #     print(f"Log: Could not open system window. Error: {e}")
         
     # 5. Return BOTH paths back to the Ionic app
     # (Note: I removed the duplicate early return from your original code)
