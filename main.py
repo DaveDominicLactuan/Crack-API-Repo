@@ -1,293 +1,586 @@
 import os
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from PIL import Image  # 1. Import Pillow
 import sys
+import uuid
+import json
+import base64
+import shutil
 import subprocess
 import cv2
 import numpy as np
 from scipy import stats
-import uuid
-import base64
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
 
-# CRITICAL: Enable CORS so your Ionic app can communicate with the API
+# Enable CORS for frontend/Ionic frameworks
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins for development
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Create an uploads directory if it doesn't exist
+# Directory Setup
 UPLOAD_DIR = "uploads"
-PROCESSED_DIR = "processed" # New folder for the OpenCV outputs
+PROCESSED_DIR = "processed"
 ASSESSED_DIR = "assessed_cracks"
+
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(PROCESSED_DIR, exist_ok=True)
 os.makedirs(ASSESSED_DIR, exist_ok=True)
-# Setup Upload Directory
-if not os.path.exists(UPLOAD_DIR):
-    os.makedirs(UPLOAD_DIR)
 
-# Mount Static Files
-
-
-# Mount the uploads folder so files can be accessed via URL (e.g., http://localhost:8000/uploads/filename.jpg)
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 app.mount("/processed", StaticFiles(directory=PROCESSED_DIR), name="processed")
 app.mount("/assessed", StaticFiles(directory=ASSESSED_DIR), name="assessed")
 
-
 PIXEL_TO_MM = 0.1
+GAP_THRESHOLD_PIXELS = 5
 
-# Function 1: Simple Text Endpoint
-@app.get("/api/hello")
-async def get_message():
-    return {"message": "Hello from your FastAPI backend 3! 🚀"}
+# =========================================================================
+# --- GEOMETRIC MODELING HELPERS (UNION-FIND & DISTANCE) ---
+# =========================================================================
 
-
-@app.post("/api/upload")
-async def upload_image(file: UploadFile = File(...)):
-    # 1. Save the raw image from the Ionic app
-    raw_file_path = os.path.join(UPLOAD_DIR, file.filename)
-    with open(raw_file_path, "wb") as buffer:
-        buffer.write(await file.read())
-        
-    # 2. Process the image
-    # We receive 3 values, 2 images the cleaned_mask, visual_img and bounding_box data
-    # We must unpack the TWO images returned by our OpenCV function
-    cleaned_mask, visual_img, bounding_boxes, cropped_roi_objectStore, resized_img_base64 = preprocess_and_save_format(raw_file_path)
+class CrackUnionFind:
+    def __init__(self, size):
+        self.parent = list(range(size))
     
-
-    # Print to the console to check the received bounding box
-    print(f"--- API ROUTE CHECK --- Bounding Boxes received: {bounding_boxes}")
-
-    # cv2.imshow("Cleaned Mask", cleaned_mask)  # Debug: Show the cleaned mask to verify it's correct
+    def find(self, i):
+        if self.parent[i] == i:
+            return i
+        self.parent[i] = self.find(self.parent[i])
+        return self.parent[i]
     
-    # 3. Save the newly processed image to the processed directory
-    processed_filename = f"processed_{file.filename}"
-    processed_file_path = os.path.join(PROCESSED_DIR, processed_filename)
-    
-    # Save the 'visual_img' with the green boxes and red dots
-    # so the user can see the results in the folders
-    cv2.imwrite(processed_file_path, visual_img)
-    
-    # (Optional) save the pure black and white mask:
-    # mask_filename = f"mask_{file.filename}"
-    # cv2.imwrite(os.path.join(PROCESSED_DIR, mask_filename), cleaned_mask)
-    
-    # 4. Open the image in a window (Using Native OS viewer)
-    # try:
-    #     if sys.platform == "win32":
-    #         os.startfile(processed_file_path)  # Windows
-    #     elif sys.platform == "darwin":
-    #         subprocess.Popen(["open", processed_file_path])  # macOS
-    #     else:
-    #         subprocess.Popen(["xdg-open", processed_file_path])  # Linux
-    # except Exception as e:
-    #     print(f"Log: Could not open system window. Error: {e}")
-        
-    # 5. Return BOTH paths back to the Ionic app
-    # (Note: I removed the duplicate early return from your original code)
-    return {
-        "message": "Image analyzed successfully!",
-        "rawImagePath": f"/uploads/{file.filename}",
-        "processedImagePath": f"/processed/{processed_filename}",
-        "bounding_boxes": bounding_boxes, # This is the new structured data about the boxes for Ionic to use
-        "cropped_roi_objectStore": cropped_roi_objectStore, # This is the new structured data about the cropped ROIs for Ionic to use
-        "resizedImagePath": resized_img_base64 # This is the Base64 string for the resized image for Ionic to use
-    }
+    def union(self, i, j):
+        root_i = self.find(i)
+        root_j = self.find(j)
+        if root_i != root_j:
+            self.parent[root_i] = root_j
 
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
-
-
-def preprocess_and_save_format(image_path):
-    # generate the txt path matching the image name for bug testing
-    # example "uploads/crack_001.jpg" becomes "uploads/crack_001.txt"
-    base_path, _ = os.path.splitext(image_path)
-    txt_path = f"{base_path}.txt"
-    
-    # Read the raw image saved by FastAPI
-    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    # Resize the image to a standard size (e.g., 416x416) for consistent processing
-    resized_img = cv2.resize(img, (416, 416), interpolation=cv2.INTER_AREA)
-    # Blurr the image with gaussian Blurr to reduce noise before thresholding
-    blurred = cv2.GaussianBlur(resized_img, (3, 3), 0)
-    # cv2.imshow("Resized", resized_img)  # Debug: Show the blurred image to verify it's correct
-    resized_img_base64 = convert_to_base64(resized_img)
-
-    # Converts the grayscale image to a binary bitmap using adaptive thresholding
-    whitehot_crack = cv2.adaptiveThreshold(
-        blurred,
-        maxValue=255,
-        adaptiveMethod=cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        thresholdType=cv2.THRESH_BINARY_INV,
-        blockSize=11,
-        C=5
-    )
-    
-    # this function connects the dots/pixels and groups touching white pixels together
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-        whitehot_crack, connectivity=8, ltype=cv2.CV_32S
-    )
-    
-    # cleaned image will hold only the valid crack components after filtering out small noise
-    cleaned_image = np.zeros_like(whitehot_crack)
-    # We create a BGR version of the resized grayscale image to draw colored boxes and circles on it and store
-    output_img = cv2.cvtColor(resized_img, cv2.COLOR_GRAY2BGR)
-
-    # 1. Initialize a list to hold the bounding box objects
-    bounding_boxes = []
-
-    # Open the text file for writing box data
-    with open(txt_path, "w") as txt_file:
-        for i in range(1, num_labels):
-            area = stats[i, cv2.CC_STAT_AREA]
-            
-            # Filter out small noise
-            if area >= 16:
-                cleaned_image[labels == i] = 255
-                
-                # Extract structural properties
-                x = stats[i, cv2.CC_STAT_LEFT]
-                y = stats[i, cv2.CC_STAT_TOP]
-                w = stats[i, cv2.CC_STAT_WIDTH]
-                h = stats[i, cv2.CC_STAT_HEIGHT]
-                
-                # Get the center point coordinates
-                cx, cy = centroids[i]
-                
-                # Draw green bounding box around foreground components
-                cv2.rectangle(output_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                
-                # Mark the center with a small red circle
-                cv2.circle(output_img, (int(cx), int(cy)), 4, (0, 0, 255), -1)
-                
-                # Output metrics to console
-                print(f"Component {i}: Area = {area}px, Center = ({cx:.1f}, {cy:.1f})")
-                
-                # --- WRITE BOUNDING BOX DATA TO TXT FILE ---
-                txt_file.write(f"{w} {h} {x} {y}\n")
-                
-                # 2. Append the dictionary to our bounding_boxes list
-                bounding_boxes.append({
-                    "w": int(w), 
-                    "h": int(h), 
-                    "x": int(x), 
-                    "y": int(y)
-                })
-
-    print(f"--- OPENCV CHECK --- Initial bounding_boxes array: {bounding_boxes}")
-
-    # --- ADDED SORTING LOGIC ---
-    # Sort the bounding boxes from largest to smallest based on area (width * height)
-    bounding_boxes.sort(key=lambda box: box["w"] * box["h"], reverse=True)
-    
-    print(f"--- OPENCV CHECK --- Sorted bounding_boxes array: {bounding_boxes}")
-
-    # =========================================================================
-    # --- CROPPING, BASE64 ENCODING & PIXEL ANALYSIS ---
-    # =========================================================================
-    
-    # Initialize the new object store for the cropped images
-    cropped_roi_objectStore = []
-
-    # Create a fresh BGR representation of the resized image
-    image = cv2.cvtColor(resized_img, cv2.COLOR_GRAY2BGR)
-    image_with_box = image.copy()
-
-    # --- LOOP: Process every box in the array ---
-    for i, box in enumerate(bounding_boxes):
-        x, y, w, h = box["x"], box["y"], box["w"], box["h"]
-        
-        # Draw the rectangle on the main image
-        cv2.rectangle(image_with_box, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-        # 1. Crop the clean region of interest
-        cropped_roi = image[y:y+h, x:x+w]
-        # cv2.imshow(f"Cropped ROI {i}", cropped_roi)  # Debug: Show the cropped ROI to verify it's correct
-
-        # 2. Encode to Base64 and save to cropped_roi_objectStore
-        success, buffer = cv2.imencode('.jpg', cropped_roi)
-        
-        if success:
-            img_base64_str = base64.b64encode(buffer).decode('utf-8')
-            image_data_uri = f"data:image/jpeg;base64,{img_base64_str}"
-        else:
-            image_data_uri = None
-
-        # Append to the separate store, using 'box_id' to link it back to the box
-        cropped_roi_objectStore.append({
-            "box_id": i,
-            "image_data": image_data_uri
-        })
-
-        # 3. Convert to Grayscale for pixel analysis
-        gray_cropped = cv2.cvtColor(cropped_roi, cv2.COLOR_BGR2GRAY)
-        
-        # 4. Convert to Binary Bitmap
-        _, bitmap_cropped = cv2.threshold(gray_cropped, 127, 255, cv2.THRESH_BINARY)
-
-        # --- PIXEL ANALYSIS ---
-        total_pixels = bitmap_cropped.size
-        white_pixels = cv2.countNonZero(bitmap_cropped)
-        black_pixels = total_pixels - white_pixels
-        
-        if total_pixels > 0:
-            white_percentage = (white_pixels / total_pixels) * 100
-            black_percentage = (black_pixels / total_pixels) * 100
-
-            # Print the results to the console
-            print(f"\n--- Image Pixel Analysis (Box {i}) ---")
-            print(f"Total Pixels: {total_pixels:,}")
-            print(f"White Pixels (Background): {white_pixels:,} ({white_percentage:.2f}%)")
-            print(f"Black Pixels (Crack):     {black_pixels:,} ({black_percentage:.2f}%)")
-
-            # Update the bounding box dictionary with pixel analysis data
-            box["total_pixels"] = int(total_pixels)
-            box["white_pixels"] = int(white_pixels)
-            box["white_percentage"] = round(white_percentage, 2)
-            box["black_pixels"] = int(black_pixels)
-            box["black_percentage"] = round(black_percentage, 2)
-
-    # 5. Return the FOUR required items
-    return cleaned_image, output_img, bounding_boxes, cropped_roi_objectStore, resized_img_base64
-
-@app.post("/api/upload2")
-async def upload_image2(file: UploadFile = File(...)):
-    # FORCE a clean filename on the server to ignore whatever the client sends
-    # This bypasses the 'filename' property corruption entirely
-    safe_filename = f"{uuid.uuid4()}.jpg"
-    file_path = os.path.join(UPLOAD_DIR, safe_filename)
-
-    try:
-        # Use shutil to stream directly to disk
-        import shutil
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-            
-        return {
-            "status": "success",
-            "filename": safe_filename,
-            "url": f"/uploads/{safe_filename}"
-        }
-    except Exception as e:
-        # Log the actual incoming filename to your server console for debugging
-        print(f"DEBUG: Incoming filename was: {file.filename}")
-        raise HTTPException(status_code=500, detail=str(e))
+def calculate_min_edge_distance(contour_a, contour_b):
+    pts_a = contour_a.reshape(-1, 2)
+    pts_b = contour_b.reshape(-1, 2)
+    dist_matrix = np.linalg.norm(pts_a[:, np.newaxis] - pts_b, axis=2)
+    return np.min(dist_matrix)
 
 def convert_to_base64(image):
-    """Converts an OpenCV image (numpy array) to a Base64 string."""
     success, buffer = cv2.imencode('.jpg', image)
     if success:
         img_base64_str = base64.b64encode(buffer).decode('utf-8')
         return f"data:image/jpeg;base64,{img_base64_str}"
     return None
+
+# =========================================================================
+# --- CORE STRUCTURAL ANALYSIS ENGINE ---
+# =========================================================================
+
+# def preprocess_and_save_format(image_path):
+#     base_path, _ = os.path.splitext(image_path)
+#     txt_path = f"{base_path}.txt"
+   
+#     # 1. Read and standardize dimensions to a standard 416x416 frame
+#     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+#     if img is None:
+#         return np.zeros((416, 416), dtype=np.uint8), np.zeros((416, 416, 3), dtype=np.uint8), [], [], ""
+        
+#     resized_img = cv2.resize(img, (416, 416), interpolation=cv2.INTER_AREA)
+#     resized_img_base64 = convert_to_base64(resized_img)
+
+#     # 2. Advanced Preprocessing (Edge-preserving Bilateral Filter + Adaptive Thresholding)
+#     smoothed_small = cv2.bilateralFilter(resized_img, d=7, sigmaColor=50, sigmaSpace=50)
+#     whitehot_crack = cv2.adaptiveThreshold(
+#         smoothed_small, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+#         cv2.THRESH_BINARY_INV, 31, 14
+#     )
+
+#     # 3. Morphological Cleaning
+#     kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 4))
+#     cleaned_mask = cv2.morphologyEx(whitehot_crack, cv2.MORPH_OPEN, kernel_small)
+
+#     # 4. Connected Components & Contour Extraction
+#     num_labels, labels, stats_map, centroids = cv2.connectedComponentsWithStats(
+#         cleaned_mask, connectivity=8, ltype=cv2.CV_32S
+#     )
+    
+#     final_cleaned_mask = np.zeros_like(cleaned_mask)
+#     for i in range(1, num_labels):
+#         #change the noise cutoff filter from 75 to 20
+#         if stats_map[i, cv2.CC_STAT_AREA] >= 20:  # Noise cutoff filter
+#             final_cleaned_mask[labels == i] = 255
+
+#     contours, _ = cv2.findContours(final_cleaned_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+#     crack_records = []
+
+#     # 5. Extract Individual Component Geometric Morphologies
+#     for count in contours:
+#         if cv2.contourArea(count) < 5:
+#             continue
+    
+#         x, y, w, h = cv2.boundingRect(count)
+#         region_of_interest = np.zeros((h + 10, w + 10), dtype=np.uint8)
+#         shifted_count = count - [x - 5, y - 5]
+#         cv2.drawContours(region_of_interest, [shifted_count], -1, 255, -1)
+        
+#         dist_map = cv2.distanceTransform(region_of_interest, cv2.DIST_L2, 5)
+#         # Structural thinning processing to find the core skeleton line
+#         skeleton = cv2.ximgproc.thinning(region_of_interest, thinningType=cv2.ximgproc.THINNING_GUOHALL)
+        
+#         pixel_length = np.sum(skeleton == 255)
+#         length_mm = pixel_length * PIXEL_TO_MM
+
+#         if pixel_length == 0:
+#             continue
+
+#         widths_mm = dist_map[skeleton == 255] * 2.0 * PIXEL_TO_MM
+#         max_w = np.max(widths_mm)
+#         mean_w = np.mean(widths_mm)
+#         mode_w = float(stats.mode(np.round(widths_mm, 2), keepdims=True).mode[0])
+        
+#         rotated_box = cv2.minAreaRect(count)
+#         orientation_angle = float(rotated_box[2])
+
+#         # ... (inside your loop)
+#         crack_records.append({
+#             "contour": count,
+#             "length_mm": length_mm,
+#             "max_width_mm": max_w,
+#             "mean_width_mm": mean_w,
+#             "mode_width_mm": mode_w,
+#             "orientation_deg": orientation_angle,
+#             "widths_raw": widths_mm
+#         })
+
+#     # The loop ends here
+#     num_fragments = len(crack_records)
+#     print(f"DEBUG: Found {num_fragments} fragments before filtering.", flush=True)
+
+#     if num_fragments == 0:
+#         return final_cleaned_mask, cv2.cvtColor(resized_img, cv2.COLOR_GRAY2BGR), [], [], resized_img_base64
+#     num_fragments = len(crack_records)
+#     if num_fragments == 0:
+#         return final_cleaned_mask, cv2.cvtColor(resized_img, cv2.COLOR_GRAY2BGR), [], [], resized_img_base64
+
+#     # 6. Execute Union-Find Algorithm to Merge Proximal Disconnected Fragments
+#     uf = CrackUnionFind(num_fragments)
+#     for i in range(num_fragments):
+#         for j in range(i + 1, num_fragments):
+#             gap = calculate_min_edge_distance(crack_records[i]["contour"], crack_records[j]["contour"])
+#             if gap <= GAP_THRESHOLD_PIXELS:
+#                 uf.union(i, j)
+
+#     clusters = {}
+#     for i in range(num_fragments):
+#         root = uf.find(i)
+#         if root not in clusters:
+#             clusters[root] = []
+#         clusters[root].append(i)
+
+#     # 7. Build Combined Structural Metrics and Draw Overlays
+#     bounding_boxes = []
+#     cropped_roi_objectStore = []
+#     output_img = cv2.cvtColor(resized_img, cv2.COLOR_GRAY2BGR)
+    
+#     target_w, target_h = 416, 416
+
+#     with open(txt_path, "w") as txt_file:
+#         for chain_id, indices in enumerate(clusters.values()):
+#             sub_cracks = [crack_records[idx] for idx in indices]
+#             total_length = sum(c["length_mm"] for c in sub_cracks)
+#             max_width = max(c["max_width_mm"] for c in sub_cracks)
+#             mean_width = np.mean(np.concatenate([c["widths_raw"] for c in sub_cracks]))
+            
+#             # Weighted average angle calculations
+#             angles = np.array([c["orientation_deg"] for c in sub_cracks])
+#             lengths = np.array([c["length_mm"] for c in sub_cracks])
+#             if total_length > 0:
+#                 percentage_weights = lengths / total_length
+#                 weighted_average_angle = np.sum(angles * percentage_weights)
+#                 within_tolerance = np.abs(angles - weighted_average_angle) <= 10.0
+#                 final_orientation = f"{weighted_average_angle:.1f}°" if np.sum(within_tolerance) > (len(sub_cracks) / 2.0) else "Curve"
+#             else:
+#                 final_orientation = "Unknown"
+
+#             # Combine contour points to calculate absolute global parameters
+#             all_contour_points = np.concatenate([c["contour"] for c in sub_cracks], axis=0)
+#             bx, by, bw, bh = cv2.boundingRect(all_contour_points)
+
+            
+            
+#             # Calculate Relative Percentages
+#             pct_x = float((bx / target_w) * 100.0)
+#             pct_y = float((by / target_h) * 100.0)
+#             pct_w = float((bw / target_w) * 100.0)
+#             pct_h = float((bh / target_h) * 100.0)
+
+#             # Write Absolute data to metrics log text file
+#             txt_file.write(f"{bw} {bh} {bx} {by}\n")
+
+#             # Draw Absolute boxes and tracking points to the validation frame
+#             cv2.rectangle(output_img, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
+#             cx, cy = bx + (bw / 2), by + (bh / 2)
+#             cv2.circle(output_img, (int(cx), int(cy)), 4, (0, 0, 255), -1)
+
+#             # Log validation statements to the environment console (ADDED flush=True)
+#             print(f"\n[Structural Unit {chain_id + 1}]", flush=True)
+#             print(f" -> Absolute Pixels: Box(x={bx}, y={by}, w={bw}, h={bh})", flush=True)
+#             print(f" -> Relative Proportions: Box(x={pct_x:.1f}%, y={pct_y:.1f}%, w={pct_w:.1f}%, h={pct_h:.1f}%)", flush=True)
+#             print(f" -> Geometric Profile: Length={total_length:.2f}mm, AvgWidth={mean_width:.2f}mm, Orient={final_orientation}", flush=True)
+
+#             # 8. Region Of Interest (ROI) Absolute Cropping & Matrix Extraction
+#             cropped_roi = output_img[by:by+bh, bx:bx+bw]
+#             success, buffer = cv2.imencode('.jpg', cropped_roi)
+#             image_data_uri = f"data:image/jpeg;base64,{base64.b64encode(buffer).decode('utf-8')}" if success else None
+            
+#             cropped_roi_objectStore.append({
+#                 "box_id": chain_id + 1,
+#                 "image_data": image_data_uri
+#             })
+
+#             # 9. Pixel Density Vector Computations inside Cropped Matrix
+#             gray_cropped = cv2.cvtColor(output_img[by:by+bh, bx:bx+bw], cv2.COLOR_BGR2GRAY)
+#             _, bitmap_cropped = cv2.threshold(gray_cropped, 127, 255, cv2.THRESH_BINARY)
+            
+#             total_pixels = bitmap_cropped.size
+#             white_pixels = cv2.countNonZero(bitmap_cropped) if total_pixels > 0 else 0
+#             black_pixels = total_pixels - white_pixels
+#             white_percentage = (white_pixels / total_pixels) * 100 if total_pixels > 0 else 0
+#             black_percentage = (black_pixels / total_pixels) * 100 if total_pixels > 0 else 0
+
+#             # Store payload containing both coordinate types and structural analytics
+
+#             print(f"DEBUG: Creating Box for ID {int(chain_id + 1)} -> x:{bx}, y:{by}, w:{bw}, h:{bh}", flush=True)
+
+#             bounding_boxes.append({
+#                 "id": int(chain_id + 1),
+#     "absolute": {"x": int(bx), "y": int(by), "w": int(bw), "h": int(bh)},
+#     "relative": {
+#         "pct_x": float(round(pct_x, 2)), 
+#         "pct_y": float(round(pct_y, 2)), 
+#         "pct_width": float(round(pct_w, 2)), 
+#         "pct_height": float(round(pct_h, 2))
+#     },
+#     "metrics": {
+#         "avgWidth_mm": float(round(mean_width, 2)),
+#         "maxWidth_mm": float(round(max_w, 2)),
+#         "crackLength_mm": float(round(total_length, 2)),
+#         "orientation": str(final_orientation) # Ensure this is a string
+#     },
+#     "pixel_analysis": {
+#         "total_pixels": int(total_pixels), 
+#         "white_percentage": float(round(white_percentage, 2)), 
+#         "black_percentage": float(round(black_percentage, 2))
+#     }
+#             })
+
+#     # Sort items based on absolute bounding spatial size surface areas
+#     bounding_boxes.sort(key=lambda b: b["absolute"]["w"] * b["absolute"]["h"], reverse=True)
+
+#     # ADDED: Print the bounding boxes after sorting to the terminal
+#     print("\n--- OPENCV CHECK --- Sorted bounding_boxes array:", flush=True)
+#     print(json.dumps(bounding_boxes, indent=2), flush=True)
+
+#     return final_cleaned_mask, output_img, bounding_boxes, cropped_roi_objectStore, resized_img_base64
+
+
+def preprocess_and_save_format(image_path):
+    base_path, _ = os.path.splitext(image_path)
+    txt_path = f"{base_path}.txt"
+    
+    # 1. Read and standardize
+    img_gray = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    img_color = cv2.imread(image_path) 
+    
+    if img_gray is None:
+        return np.zeros((416, 416), dtype=np.uint8), np.zeros((416, 416, 3), dtype=np.uint8), [], [], ""
+        
+    # Resize BOTH
+    resized_gray = cv2.resize(img_gray, (416, 416), interpolation=cv2.INTER_AREA)
+    resized_color = cv2.resize(img_color, (416, 416), interpolation=cv2.INTER_AREA)
+    
+    # Convert to Base64 only when needed (e.g., for JSON response), not for image processing
+    resized_img_base64 = convert_to_base64(resized_color)
+
+    if "," in resized_img_base64:
+        base64_clean = resized_img_base64.split(",")[1]
+    else:
+        base64_clean = resized_img_base64
+
+    img_bytes = base64.b64decode(base64_clean)
+    np_arr = np.frombuffer(img_bytes, np.uint8)
+    debug_img_matrix = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+    if debug_img_matrix is not None:
+        debug_dir = "debug_crops"
+        os.makedirs(debug_dir, exist_ok=True)
+        cv2.imwrite(os.path.join(debug_dir, "resized_base64_debug.jpg"), debug_img_matrix)
+        print("DEBUG: Successfully saved base64 image to debug_outputs/resized_base64_debug.jpg", flush=True)
+
+    # 2. Advanced Preprocessing (Use the resized_gray array, NOT the base64 string)
+    smoothed_small = cv2.bilateralFilter(resized_gray, d=7, sigmaColor=50, sigmaSpace=50)
+    whitehot_crack = cv2.adaptiveThreshold(
+        smoothed_small, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 31, 14
+    )
+
+    # 3. Morphological Cleaning
+    kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 4))
+    cleaned_mask = cv2.morphologyEx(whitehot_crack, cv2.MORPH_OPEN, kernel_small)
+
+    # 4. Connected Components & Contour Extraction
+    num_labels, labels, stats_map, centroids = cv2.connectedComponentsWithStats(
+        cleaned_mask, connectivity=8, ltype=cv2.CV_32S
+    )
+    
+    final_cleaned_mask = np.zeros_like(cleaned_mask)
+    for i in range(1, num_labels):
+        if stats_map[i, cv2.CC_STAT_AREA] >= 20:  
+            final_cleaned_mask[labels == i] = 255
+
+    contours, _ = cv2.findContours(final_cleaned_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    crack_records = []
+
+    # 5. Extract Individual Component Geometric Morphologies
+    for count in contours:
+        if cv2.contourArea(count) < 5:
+            continue
+    
+        x, y, w, h = cv2.boundingRect(count)
+        region_of_interest = np.zeros((h + 10, w + 10), dtype=np.uint8)
+        shifted_count = count - [x - 5, y - 5]
+        cv2.drawContours(region_of_interest, [shifted_count], -1, 255, -1)
+        
+        dist_map = cv2.distanceTransform(region_of_interest, cv2.DIST_L2, 5)
+        skeleton = cv2.ximgproc.thinning(region_of_interest, thinningType=cv2.ximgproc.THINNING_GUOHALL)
+        
+        pixel_length = np.sum(skeleton == 255)
+        length_mm = pixel_length * PIXEL_TO_MM
+
+        if pixel_length == 0:
+            continue
+
+        widths_mm = dist_map[skeleton == 255] * 2.0 * PIXEL_TO_MM
+        max_w = np.max(widths_mm)
+        mean_w = np.mean(widths_mm)
+        
+        # --- SCIPY FIX ---
+        mode_result = stats.mode(np.round(widths_mm, 2), keepdims=True)
+        # Handle different scipy versions for mode extraction
+        mode_w = float(mode_result.mode.item(0) if hasattr(mode_result.mode, 'item') else mode_result.mode)
+        
+        rotated_box = cv2.minAreaRect(count)
+        
+        # Access the angle at index 2
+        orientation_angle = float(rotated_box[2])
+
+        crack_records.append({
+            "contour": count,
+            "length_mm": length_mm,
+            "max_width_mm": max_w,
+            "mean_width_mm": mean_w,
+            "mode_width_mm": mode_w,
+            "orientation_deg": orientation_angle,
+            "widths_raw": widths_mm
+        })
+
+    num_fragments = len(crack_records)
+    
+    # If no cracks, return early
+    if num_fragments == 0:
+        return final_cleaned_mask, resized_color, [], [], resized_img_base64
+
+    # 6. Execute Union-Find
+    uf = CrackUnionFind(num_fragments)
+    for i in range(num_fragments):
+        for j in range(i + 1, num_fragments):
+            gap = calculate_min_edge_distance(crack_records[i]["contour"], crack_records[j]["contour"])
+            if gap <= GAP_THRESHOLD_PIXELS:
+                uf.union(i, j)
+
+    clusters = {}
+    for i in range(num_fragments):
+        root = uf.find(i)
+        if root not in clusters:
+            clusters[root] = []
+        clusters[root].append(i)
+
+    # 7. Build Metrics and Draw Overlays
+    bounding_boxes = []
+    cropped_roi_objectStore = []
+    output_img = resized_color.copy() # Use the color version for drawing
+    
+    target_w, target_h = 416, 416
+
+    with open(txt_path, "w") as txt_file:
+        for chain_id, indices in enumerate(clusters.values()):
+            sub_cracks = [crack_records[idx] for idx in indices]
+            total_length = sum(c["length_mm"] for c in sub_cracks)
+            max_width = max(c["max_width_mm"] for c in sub_cracks)
+            mean_width = np.mean(np.concatenate([c["widths_raw"] for c in sub_cracks]))
+            
+            # Weighted average angle calculations
+            angles = np.array([c["orientation_deg"] for c in sub_cracks])
+            lengths = np.array([c["length_mm"] for c in sub_cracks])
+            if total_length > 0:
+                percentage_weights = lengths / total_length
+                weighted_average_angle = np.sum(angles * percentage_weights)
+                within_tolerance = np.abs(angles - weighted_average_angle) <= 10.0
+                final_orientation = f"{weighted_average_angle:.1f}°" if np.sum(within_tolerance) > (len(sub_cracks) / 2.0) else "Curve"
+            else:
+                final_orientation = "Unknown"
+
+            # Combine contour points to calculate absolute global parameters
+            all_contour_points = np.concatenate([c["contour"] for c in sub_cracks], axis=0)
+            bx, by, bw, bh = cv2.boundingRect(all_contour_points)
+            
+            # --- SAFETY CHECK & ROI PROCESSING ---
+            if bw > 0 and bh > 0:
+                # Calculate Relative Percentages
+                pct_x = float((bx / target_w) * 100.0)
+                pct_y = float((by / target_h) * 100.0)
+                pct_w = float((bw / target_w) * 100.0)
+                pct_h = float((bh / target_h) * 100.0)
+
+                # Write Absolute data to metrics log text file
+                txt_file.write(f"{bw} {bh} {bx} {by}\n")
+
+                # Draw Absolute boxes and tracking points to the validation frame
+                cv2.rectangle(output_img, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
+                cx, cy = bx + (bw / 2), by + (bh / 2)
+                cv2.circle(output_img, (int(cx), int(cy)), 4, (0, 0, 255), -1)
+
+                # Log validation statements to the environment console
+                print(f"\n[Structural Unit {chain_id + 1}]", flush=True)
+                print(f" -> Absolute Pixels: Box(x={bx}, y={by}, w={bw}, h={bh})", flush=True)
+                print(f" -> Relative Proportions: Box(x={pct_x:.1f}%, y={pct_y:.1f}%, w={pct_w:.1f}%, h={pct_h:.1f}%)", flush=True)
+                print(f" -> Geometric Profile: Length={total_length:.2f}mm, AvgWidth={mean_width:.2f}mm, Orient={final_orientation}", flush=True)
+                print(f"DEBUG: Creating Box for ID {int(chain_id + 1)} -> x:{bx}, y:{by}, w:{bw}, h:{bh}", flush=True)
+
+                # 8. Region Of Interest (ROI) Absolute Cropping & Matrix Extraction
+                # Using resized_img here ensures we get the clean image without the green boxes drawn over it
+                cropped_roi = resized_color[by:by+bh, bx:bx+bw]
+                success, buffer = cv2.imencode('.jpg', cropped_roi)
+                image_data_uri = f"data:image/jpeg;base64,{base64.b64encode(buffer).decode('utf-8')}" if success else None
+                
+                cropped_roi_objectStore.append({
+                    "box_id": int(chain_id + 1),
+                    "image_data": image_data_uri
+                })
+
+                # 9. Pixel Density Vector Computations inside Cropped Matrix
+                # 9. Pixel Density Vector Computations inside Cropped Matrix
+                # Convert the color crop to grayscale first
+                gray_roi = cv2.cvtColor(cropped_roi, cv2.COLOR_BGR2GRAY)
+
+                # Apply threshold to the 1-channel grayscale image
+                _, bitmap_cropped = cv2.threshold(gray_roi, 127, 255, cv2.THRESH_BINARY)
+                
+                total_pixels = bitmap_cropped.size
+                white_pixels = cv2.countNonZero(bitmap_cropped) if total_pixels > 0 else 0
+                black_pixels = total_pixels - white_pixels
+                white_percentage = (white_pixels / total_pixels) * 100 if total_pixels > 0 else 0
+                black_percentage = (black_pixels / total_pixels) * 100 if total_pixels > 0 else 0
+
+                # Store payload containing both coordinate types and structural analytics (Explicitly cast for JSON safety)
+                bounding_boxes.append({
+                    "id": int(chain_id + 1),
+                    "absolute": {"x": int(bx), "y": int(by), "w": int(bw), "h": int(bh)},
+                    "relative": {
+                        "pct_x": float(round(pct_x, 2)), 
+                        "pct_y": float(round(pct_y, 2)), 
+                        "pct_width": float(round(pct_w, 2)), 
+                        "pct_height": float(round(pct_h, 2))
+                    },
+                    "metrics": {
+                        "avgWidth_mm": float(round(mean_width, 2)),
+                        "maxWidth_mm": float(round(max_width, 2)),
+                        "crackLength_mm": float(round(total_length, 2)),
+                        "orientation": str(final_orientation)
+                    },
+                    "pixel_analysis": {
+                        "total_pixels": int(total_pixels), 
+                        "white_percentage": float(round(white_percentage, 2)), 
+                        "black_percentage": float(round(black_percentage, 2))
+                    }
+                })
+            else:
+                print(f"DEBUG: Skipping invalid crop for Box {chain_id + 1} (Zero width/height)", flush=True)
+
+    # Sort items based on absolute bounding spatial size surface areas
+    bounding_boxes.sort(key=lambda b: b["absolute"]["w"] * b["absolute"]["h"], reverse=True)
+
+    # ADDED: Print the bounding boxes after sorting to the terminal
+    print("\n--- OPENCV CHECK --- Sorted bounding_boxes array:", flush=True)
+    print(json.dumps(bounding_boxes, indent=2), flush=True)
+
+    # --- NEW FUNCTION: SAVE CROPS TO DISK FOR SAFE API DEBUGGING ---
+    debug_dir = "debug_crops"
+    os.makedirs(debug_dir, exist_ok=True) # Ensure folder exists
+    
+    for item in cropped_roi_objectStore:
+        box_id = item["box_id"]
+        image_data_uri = item["image_data"]
+
+        if image_data_uri:
+            base64_str = image_data_uri.split(",")[1]
+            img_bytes = base64.b64decode(base64_str)
+            np_arr = np.frombuffer(img_bytes, np.uint8)
+            img_matrix = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            
+            if img_matrix is not None:
+                # Save to disk instead of popping up a window
+                save_path = os.path.join(debug_dir, f"box_{box_id}.jpg")
+                cv2.imwrite(save_path, img_matrix)
+                print(f"DEBUG: Saved cropped image {box_id} to {save_path}", flush=True)
+
+    return final_cleaned_mask, output_img, bounding_boxes, cropped_roi_objectStore, resized_img_base64
+
+# =========================================================================
+# --- API ROUTING LAYER ---
+# =========================================================================
+
+@app.get("/api/hello")
+async def get_message():
+    return {"message": "Hello from your advanced FastAPI analysis engine! 🚀"}
+
+@app.post("/api/upload")
+async def upload_image(file: UploadFile = File(...)):
+    raw_file_path = os.path.join(UPLOAD_DIR, file.filename)
+    with open(raw_file_path, "wb") as buffer:
+        buffer.write(await file.read())
+        
+    # Execute structural pipeline parsing
+    final_cleaned_mask, visual_img, bounding_boxes, cropped_roi_objectStore, resized_img_base64 = preprocess_and_save_format(raw_file_path)
+ 
+    # Save validation image representation to system directories
+    processed_filename = f"processed_{file.filename}"
+    processed_file_path = os.path.join(PROCESSED_DIR, processed_filename)
+    cv2.imwrite(processed_file_path, visual_img)
+    
+    # SYSTEM VISUAL VALIDATION: Open output image automatically using OS native graphics module
+    try:
+        if sys.platform == "win32":
+            os.startfile(processed_file_path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", processed_file_path])
+        else:
+            subprocess.Popen(["xdg-open", processed_file_path])
+        
+        # ADDED flush=True here as well
+        print(f"Validation Display Active: Opened '{processed_filename}' in OS system window.", flush=True)
+    except Exception as e:
+        print(f"Log: Could not spawn automated native window workspace validation. Error: {e}", flush=True)
+        
+    return {
+        "message": "Image analyzed successfully using Union-Find geometric modeling!",
+        "rawImagePath": f"/uploads/{file.filename}",
+        "processedImagePath": f"/processed/{processed_filename}",
+        "bounding_boxes": bounding_boxes, 
+        "cropped_roi_objectStore": cropped_roi_objectStore, 
+        "resizedImagePath": resized_img_base64 
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
