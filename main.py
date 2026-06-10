@@ -361,19 +361,19 @@ async def upload_image(file: UploadFile = File(...)):
     
 
     
-    # SYSTEM VISUAL VALIDATION: Open output image automatically using OS native graphics module
-    try:
-        if sys.platform == "win32":
-            os.startfile(processed_file_path)
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", processed_file_path])
-        else:
-            subprocess.Popen(["xdg-open", processed_file_path])
+    # # SYSTEM VISUAL VALIDATION: Open output image automatically using OS native graphics module
+    # try:
+    #     if sys.platform == "win32":
+    #         os.startfile(processed_file_path)
+    #     elif sys.platform == "darwin":
+    #         subprocess.Popen(["open", processed_file_path])
+    #     else:
+    #         subprocess.Popen(["xdg-open", processed_file_path])
         
-        # ADDED flush=True here as well
-        print(f"Validation Display Active: Opened '{processed_filename}' in OS system window.", flush=True)
-    except Exception as e:
-        print(f"Log: Could not spawn automated native window workspace validation. Error: {e}", flush=True)
+    #     # ADDED flush=True here as well
+    #     print(f"Validation Display Active: Opened '{processed_filename}' in OS system window.", flush=True)
+    # except Exception as e:
+    #     print(f"Log: Could not spawn automated native window workspace validation. Error: {e}", flush=True)
         
     return {
         "message": "Image analyzed successfully using Union-Find geometric modeling!",
