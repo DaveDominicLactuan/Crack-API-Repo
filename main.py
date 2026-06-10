@@ -250,15 +250,35 @@ def preprocess_and_save_format(image_path):
                 print(f"DEBUG: Creating Box for ID {int(chain_id + 1)} -> x:{bx}, y:{by}, w:{bw}, h:{bh}", flush=True)
 
                 # 8. Region Of Interest (ROI) Absolute Cropping & Matrix Extraction
-                # Using resized_img here ensures we get the clean image without the green boxes drawn over it
                 cropped_roi = resized_color[by:by+bh, bx:bx+bw]
+
+                # cv2.imshow(f"Debug Crop {chain_id + 1}", cropped_roi)
+                # cv2.waitKey(0) # Waits indefinitely until you press a key
+                # cv2.destroyAllWindows() # Closes the window
+                # ------------------------------
+
+                success, buffer = cv2.imencode('.jpg', cropped_roi)
+                
+                # --- A. Generate Base64 for the API response ---
                 success, buffer = cv2.imencode('.jpg', cropped_roi)
                 image_data_uri = f"data:image/jpeg;base64,{base64.b64encode(buffer).decode('utf-8')}" if success else None
                 
+                # --- B. Save locally for debug_crops ---
+                box_id = int(chain_id + 1)
+                debug_dir = "debug_crops"
+                os.makedirs(debug_dir, exist_ok=True) # Ensure folder exists
+                save_path = os.path.join(debug_dir, f"box_{box_id}.jpg")
+                
+                if success:
+                    cv2.imwrite(save_path, cropped_roi)
+                    print(f"DEBUG: Successfully saved cropped image {box_id} to {save_path}", flush=True)
+                
+                # --- C. Store in the object store for the API return ---
                 cropped_roi_objectStore.append({
-                    "box_id": int(chain_id + 1),
+                    "box_id": box_id,
                     "image_data": image_data_uri
                 })
+
 
                 # 9. Pixel Density Vector Computations inside Cropped Matrix
                 # 9. Pixel Density Vector Computations inside Cropped Matrix
@@ -275,56 +295,44 @@ def preprocess_and_save_format(image_path):
                 black_percentage = (black_pixels / total_pixels) * 100 if total_pixels > 0 else 0
 
                 # Store payload containing both coordinate types and structural analytics (Explicitly cast for JSON safety)
-                bounding_boxes.append({
-                    "id": int(chain_id + 1),
-                    "absolute": {"x": int(bx), "y": int(by), "w": int(bw), "h": int(bh)},
-                    "relative": {
-                        "pct_x": float(round(pct_x, 2)), 
-                        "pct_y": float(round(pct_y, 2)), 
-                        "pct_width": float(round(pct_w, 2)), 
-                        "pct_height": float(round(pct_h, 2))
-                    },
-                    "metrics": {
-                        "avgWidth_mm": float(round(mean_width, 2)),
-                        "maxWidth_mm": float(round(max_width, 2)),
-                        "crackLength_mm": float(round(total_length, 2)),
-                        "orientation": str(final_orientation)
-                    },
-                    "pixel_analysis": {
-                        "total_pixels": int(total_pixels), 
-                        "white_percentage": float(round(white_percentage, 2)), 
-                        "black_percentage": float(round(black_percentage, 2))
-                    }
-                })
+                # bounding_boxes.append({
+                #     "id": int(chain_id + 1),
+                #     "absolute": {"x": int(bx), "y": int(by), "w": int(bw), "h": int(bh)},
+                #     "relative": {
+                #         "pct_x": float(round(pct_x, 2)), 
+                #         "pct_y": float(round(pct_y, 2)), 
+                #         "pct_width": float(round(pct_w, 2)), 
+                #         "pct_height": float(round(pct_h, 2))
+                #     },
+                #     "metrics": {
+                #         "avgWidth_mm": float(round(mean_width, 2)),
+                #         "maxWidth_mm": float(round(max_width, 2)),
+                #         "crackLength_mm": float(round(total_length, 2)),
+                #         "orientation": str(final_orientation)
+                #     },
+                #     "pixel_analysis": {
+                #         "total_pixels": int(total_pixels), 
+                #         "white_percentage": float(round(white_percentage, 2)), 
+                #         "black_percentage": float(round(black_percentage, 2))
+                #     }
+                # })
+                bounding_boxes.append(
+                    {"x": int(bx),
+                     "y": int(by),
+                     "w": int(bw),
+                     "h": int(bh)}
+                )
             else:
                 print(f"DEBUG: Skipping invalid crop for Box {chain_id + 1} (Zero width/height)", flush=True)
 
     # Sort items based on absolute bounding spatial size surface areas
-    bounding_boxes.sort(key=lambda b: b["absolute"]["w"] * b["absolute"]["h"], reverse=True)
+    bounding_boxes.sort(key=lambda b: b["w"] * b["h"], reverse=True)
 
     # ADDED: Print the bounding boxes after sorting to the terminal
     print("\n--- OPENCV CHECK --- Sorted bounding_boxes array:", flush=True)
     print(json.dumps(bounding_boxes, indent=2), flush=True)
 
-    # --- NEW FUNCTION: SAVE CROPS TO DISK FOR SAFE API DEBUGGING ---
-    debug_dir = "debug_crops"
-    os.makedirs(debug_dir, exist_ok=True) # Ensure folder exists
     
-    for item in cropped_roi_objectStore:
-        box_id = item["box_id"]
-        image_data_uri = item["image_data"]
-
-        if image_data_uri:
-            base64_str = image_data_uri.split(",")[1]
-            img_bytes = base64.b64decode(base64_str)
-            np_arr = np.frombuffer(img_bytes, np.uint8)
-            img_matrix = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-            
-            if img_matrix is not None:
-                # Save to disk instead of popping up a window
-                save_path = os.path.join(debug_dir, f"box_{box_id}.jpg")
-                cv2.imwrite(save_path, img_matrix)
-                print(f"DEBUG: Saved cropped image {box_id} to {save_path}", flush=True)
 
     return final_cleaned_mask, output_img, bounding_boxes, cropped_roi_objectStore, resized_img_base64
 
@@ -343,12 +351,15 @@ async def upload_image(file: UploadFile = File(...)):
         buffer.write(await file.read())
         
     # Execute structural pipeline parsing
-    final_cleaned_mask, visual_img, bounding_boxes, cropped_roi_objectStore, resized_img_base64 = preprocess_and_save_format(raw_file_path)
- 
+    # final_cleaned_mask, visual_img, bounding_boxes, cropped_roi_objectStore, resized_img_base64 = preprocess_and_save_format(raw_file_path)
+    final_cleaned_mask, output_img, bounding_boxes, cropped_roi_objectStore, resized_img_base64 = preprocess_and_save_format(raw_file_path)
+
     # Save validation image representation to system directories
     processed_filename = f"processed_{file.filename}"
     processed_file_path = os.path.join(PROCESSED_DIR, processed_filename)
-    cv2.imwrite(processed_file_path, visual_img)
+    cv2.imwrite(processed_file_path, output_img)
+    
+
     
     # SYSTEM VISUAL VALIDATION: Open output image automatically using OS native graphics module
     try:
